@@ -6,15 +6,16 @@ import { Button } from "@/components/ui/button";
 import StretchCanvas from "./StretchCanvas";
 import StretchLevelSelector from "./StretchLevelSelector";
 import Instructions from "./Instructions";
+import { Toaster, toast } from "sonner";
 
 const MAX_CANVAS_SIZE = 800;
 
-const PixelStretcher: React.FC = () => {
+const PixelPlay: React.FC = () => {
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [brushSize, setBrushSize] = useState<number>(20);
-  const [stretchLevel, setStretchLevel] = useState<number>(2);
+  const [effectType, setEffectType] = useState<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null!);
 
   const resizeImage = useCallback(
     (img: HTMLImageElement): HTMLCanvasElement => {
@@ -37,8 +38,17 @@ const PixelStretcher: React.FC = () => {
       canvas.width = width;
       canvas.height = height;
 
-      const ctx = canvas.getContext("2d");
-      ctx?.drawImage(img, 0, 0, width, height);
+      const ctx = canvas.getContext("2d", {
+        alpha: true,
+        willReadFrequently: true,
+      });
+
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+
+        ctx.drawImage(img, 0, 0, width, height);
+      }
 
       return canvas;
     },
@@ -54,8 +64,11 @@ const PixelStretcher: React.FC = () => {
         img.onload = () => {
           const resizedCanvas = resizeImage(img);
           const resizedImage = new Image();
-          resizedImage.onload = () => setImage(resizedImage);
-          resizedImage.src = resizedCanvas.toDataURL();
+          resizedImage.onload = () => {
+            setImage(resizedImage);
+            toast.success("Image uploaded successfully");
+          };
+          resizedImage.src = resizedCanvas.toDataURL("image/png", 1.0);
         };
         img.src = e.target?.result as string;
       };
@@ -67,12 +80,50 @@ const PixelStretcher: React.FC = () => {
     fileInputRef.current?.click();
   };
 
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const file = e.dataTransfer.files[0];
+      if (file && file.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            const resizedCanvas = resizeImage(img);
+            const resizedImage = new Image();
+            resizedImage.onload = () => {
+              setImage(resizedImage);
+              toast.success("Image uploaded successfully");
+            };
+            resizedImage.src = resizedCanvas.toDataURL("image/png", 1.0);
+          };
+          img.src = e.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+      }
+    },
+    [resizeImage]
+  );
+
   const handleDownload = () => {
     if (canvasRef.current) {
-      const link = document.createElement("a");
-      link.download = "stretched-image.png";
-      link.href = canvasRef.current.toDataURL("image/png");
-      link.click();
+      const defaultName = `pixel_play_${new Date().toISOString().slice(0, 10)}`;
+      const fileName = window.prompt("Save image as:", defaultName);
+
+      if (fileName) {
+        const link = document.createElement("a");
+        link.download = `${fileName}.png`;
+        link.href = canvasRef.current.toDataURL("image/png", 1.0);
+        link.click();
+        toast.success("Image downloaded successfully");
+      }
     }
   };
 
@@ -82,6 +133,7 @@ const PixelStretcher: React.FC = () => {
       if (ctx) {
         ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
         ctx.drawImage(image, 0, 0);
+        toast.success("Canvas reset");
       }
     }
   }, [image]);
@@ -90,8 +142,8 @@ const PixelStretcher: React.FC = () => {
     setBrushSize(newSize);
   };
 
-  const handleStretchLevelChange = (level: number) => {
-    setStretchLevel(level);
+  const handleEffectTypeChange = (type: number) => {
+    setEffectType(type);
   };
 
   useEffect(() => {
@@ -109,37 +161,48 @@ const PixelStretcher: React.FC = () => {
   }, []);
 
   return (
-    <div className="min-h-screen bg-gray-100 py-12 px-4 sm:px-6 lg:px-8">
+    <div className="min-h-screen bg-zinc-950 py-12 px-4 sm:px-6 lg:px-8 text-zinc-100">
+      <Toaster
+        position="bottom-right"
+        toastOptions={{
+          style: {
+            background: "#18181b",
+            border: "1px solid #27272a",
+            color: "#fafafa",
+          },
+          className: "text-sm font-light",
+        }}
+      />
       <div className="max-w-7xl mx-auto">
         <div className="text-center mb-16">
-          <h1 className="text-6xl font-extrabold text-gray-900 tracking-tight">
-            PIXEL STRETCHER
+          <h1 className="text-6xl font-light text-zinc-100 tracking-tight">
+            Pixel Play
           </h1>
-          <p className="mt-4 text-xl text-gray-500">
-            Transform your images with a touch of stretch
+          <p className="mt-4 text-xl text-zinc-400 font-light">
+            Digital art manipulation, reimagined
           </p>
         </div>
-        <div className="bg-white shadow-2xl rounded-lg overflow-hidden">
+        <div className="bg-zinc-900 shadow-2xl rounded-lg overflow-hidden border border-zinc-800">
           <div className="p-8">
             <div className="flex justify-between items-center mb-8">
               <div className="space-x-4">
                 <Button
                   onClick={handleUploadClick}
-                  className="bg-black text-white hover:bg-gray-800"
+                  className="bg-zinc-100 text-zinc-900 hover:bg-zinc-200"
                 >
                   Upload Image
                 </Button>
                 <Button
                   onClick={handleDownload}
                   disabled={!image}
-                  className="bg-gray-200 text-gray-800 hover:bg-gray-300"
+                  className="bg-zinc-700 text-zinc-100 hover:bg-zinc-600 disabled:opacity-50"
                 >
                   Download Image
                 </Button>
                 <Button
                   onClick={handleReset}
                   disabled={!image}
-                  className="bg-gray-200 text-gray-800 hover:bg-gray-300"
+                  className="bg-zinc-700 text-zinc-100 hover:bg-zinc-600 disabled:opacity-50"
                 >
                   Reset Canvas
                 </Button>
@@ -152,40 +215,52 @@ const PixelStretcher: React.FC = () => {
                 />
               </div>
               <StretchLevelSelector
-                level={stretchLevel}
-                onChange={handleStretchLevelChange}
+                level={effectType}
+                onChange={handleEffectTypeChange}
               />
             </div>
-            <div className="flex items-center justify-center mb-8">
+            <div
+              className="flex items-center justify-center mb-8"
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
+            >
               <div className="w-full max-w-3xl">
                 {image ? (
                   <StretchCanvas
                     image={image}
                     brushSize={brushSize}
-                    stretchLevel={stretchLevel}
+                    effectType={effectType}
                     canvasRef={canvasRef}
                     onBrushSizeChange={handleBrushSizeChange}
                   />
                 ) : (
-                  <div className="border-4 border-dashed border-gray-200 rounded-lg h-96 flex items-center justify-center">
-                    <p className="text-gray-500 text-xl">
-                      Upload an image to start stretching
+                  <div
+                    className="border-4 border-dashed border-zinc-700 rounded-lg h-96 flex flex-col items-center justify-center transition-colors hover:border-yellow-200/25"
+                    onClick={handleUploadClick}
+                  >
+                    <p className="text-zinc-500 text-xl font-light mb-4">
+                      Drop an image here
+                    </p>
+                    <p className="text-zinc-500 text-xl font-light">
+                      or click to upload
                     </p>
                   </div>
                 )}
               </div>
             </div>
             <div className="text-center">
-              <p className="text-gray-500 mb-2">Brush Size: {brushSize}px</p>
+              <p className="text-zinc-400 mb-2 font-light">
+                Brush Size: {brushSize}px
+              </p>
               <input
                 type="range"
                 min="1"
-                max="100"
+                max="200"
                 value={brushSize}
                 onChange={(e) =>
                   handleBrushSizeChange(Number.parseInt(e.target.value))
                 }
-                className="w-full max-w-xs"
+                className="w-full max-w-xs accent-yellow-200"
               />
             </div>
           </div>
@@ -196,4 +271,4 @@ const PixelStretcher: React.FC = () => {
   );
 };
 
-export default PixelStretcher;
+export default PixelPlay;

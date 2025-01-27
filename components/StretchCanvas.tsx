@@ -1,314 +1,514 @@
+"use client";
+
 import type React from "react";
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 
 interface StretchCanvasProps {
   image: HTMLImageElement;
   brushSize: number;
-  stretchLevel: number;
+  effectType: number; // 0: Smudge, 1: Blur, 2: Pixelate
   canvasRef: React.RefObject<HTMLCanvasElement>;
-  onBrushSizeChange: (newSize: number) => void;
+  onBrushSizeChange: (size: number) => void;
+}
+
+interface StretchPoint {
+  x: number;
+  y: number;
+}
+
+interface CanvasState {
+  imageData: ImageData;
+  timestamp: number;
 }
 
 const StretchCanvas: React.FC<StretchCanvasProps> = ({
   image,
   brushSize,
-  stretchLevel,
+  effectType,
   canvasRef,
   onBrushSizeChange,
 }) => {
-  const cursorCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [isStretching, setIsStretching] = useState(false);
-  const [startPosition, setStartPosition] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [cursorPosition, setCursorPosition] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [stretchBuffer, setStretchBuffer] = useState<ImageData | null>(null);
-  const [originalCanvas, setOriginalCanvas] =
-    useState<HTMLCanvasElement | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [lastX, setLastX] = useState(0);
+  const [lastY, setLastY] = useState(0);
+  const brushRef = useRef<HTMLDivElement>(null);
+
+  // Track if mouse is over canvas
+  const [isOverCanvas, setIsOverCanvas] = useState(false);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+
+  // Add state for stretch start point
+  const [stretchStart, setStretchStart] = useState<StretchPoint | null>(null);
+  const [stretchPreview, setStretchPreview] = useState<StretchPoint | null>(
+    null
+  );
+
+  // Add state for undo history
+  const [undoStack, setUndoStack] = useState<CanvasState[]>([]);
+  const isUndoingRef = useRef(false);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (canvasRef.current) {
+      canvasRef.current.width = image.width;
+      canvasRef.current.height = image.height;
+      const ctx = canvasRef.current.getContext("2d", {
+        alpha: true,
+        willReadFrequently: true,
+      });
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    canvas.width = image.width;
-    canvas.height = image.height;
-    ctx.drawImage(image, 0, 0);
-
-    const origCanvas = document.createElement("canvas");
-    origCanvas.width = image.width;
-    origCanvas.height = image.height;
-    const origCtx = origCanvas.getContext("2d");
-    if (origCtx) {
-      origCtx.drawImage(image, 0, 0);
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(image, 0, 0);
+      }
     }
-    setOriginalCanvas(origCanvas);
   }, [image, canvasRef]);
 
+  // Create preview canvas for live feedback
   useEffect(() => {
-    const cursorCanvas = cursorCanvasRef.current;
-    if (!cursorCanvas) return;
+    if (canvasRef.current) {
+      const preview = document.createElement("canvas");
+      preview.width = canvasRef.current.width;
+      preview.height = canvasRef.current.height;
+      setStretchPreview({ x: 0, y: 0 });
+    }
+  }, [canvasRef]);
 
-    cursorCanvas.width = image.width;
-    cursorCanvas.height = image.height;
+  // Save initial state when image loads
+  useEffect(() => {
+    if (canvasRef.current && image) {
+      const ctx = canvasRef.current.getContext("2d");
+      if (ctx) {
+        const imageData = ctx.getImageData(
+          0,
+          0,
+          canvasRef.current.width,
+          canvasRef.current.height
+        );
+        setUndoStack([{ imageData, timestamp: Date.now() }]);
+      }
+    }
+  }, [image]);
 
-    const ctx = cursorCanvas.getContext("2d");
-    if (!ctx) return;
-
-    const drawCursor = () => {
-      if (!cursorPosition) return;
-      ctx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
-      ctx.beginPath();
-      ctx.rect(
-        cursorPosition.x - brushSize / 2,
-        cursorPosition.y - brushSize / 2,
-        brushSize,
-        brushSize
-      );
-      ctx.strokeStyle = "white";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.strokeStyle = "black";
-      ctx.lineWidth = 1;
-      ctx.stroke();
+  // Handle keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+        e.preventDefault();
+        handleUndo();
+      }
     };
 
-    drawCursor();
-  }, [image, brushSize, cursorPosition]);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
-  const handleMouseMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
+  const saveState = useCallback(() => {
+    if (!canvasRef.current || isUndoingRef.current) return;
 
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-    setCursorPosition({ x, y });
-
-    if (isStretching && startPosition && stretchBuffer && originalCanvas) {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      const dx = x - startPosition.x;
-      const dy = y - startPosition.y;
-
-      stretchPixels(
-        ctx,
-        startPosition.x,
-        startPosition.y,
-        dx,
-        dy,
-        brushSize,
-        stretchBuffer,
-        originalCanvas
+    const ctx = canvasRef.current.getContext("2d");
+    if (ctx) {
+      const imageData = ctx.getImageData(
+        0,
+        0,
+        canvasRef.current.width,
+        canvasRef.current.height
       );
+      setUndoStack((prev) => [...prev, { imageData, timestamp: Date.now() }]);
     }
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    setUndoStack((prev) => {
+      if (prev.length <= 1) return prev; // Keep initial state
+
+      const newStack = prev.slice(0, -1);
+      const lastState = newStack[newStack.length - 1];
+
+      if (canvasRef.current) {
+        isUndoingRef.current = true;
+        const ctx = canvasRef.current.getContext("2d");
+        if (ctx) {
+          ctx.putImageData(lastState.imageData, 0, 0);
+        }
+        isUndoingRef.current = false;
+      }
+
+      return newStack;
+    });
+  }, []);
+
+  // Function to get canvas-relative coordinates and scale
+  const getCanvasMetrics = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+
+    // Get coordinates relative to canvas
+    const canvasX = (e.clientX - rect.left) * scaleX;
+    const canvasY = (e.clientY - rect.top) * scaleY;
+
+    // Get screen coordinates for brush cursor
+    const screenX = e.clientX;
+    const screenY = e.clientY;
+
+    return {
+      canvasX,
+      canvasY,
+      screenX,
+      screenY,
+      scaleX: rect.width / canvas.width,
+      scaleY: rect.height / canvas.height,
+    };
+  };
+
+  const applyStretch = (
+    ctx: CanvasRenderingContext2D,
+    start: StretchPoint,
+    end: StretchPoint
+  ) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const distance = Math.hypot(dx, dy);
+    const angle = Math.atan2(dy, dx);
+
+    const perpX = -dy / distance;
+    const perpY = dx / distance;
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = Math.ceil(distance);
+    tempCanvas.height = brushSize;
+    const tempCtx = tempCanvas.getContext("2d", {
+      alpha: true,
+      willReadFrequently: true,
+    });
+
+    if (tempCtx) {
+      tempCtx.imageSmoothingEnabled = true;
+      tempCtx.imageSmoothingQuality = "high";
+
+      // Sample pixels with better interpolation
+      for (let i = 0; i < brushSize; i++) {
+        const sampleX = start.x + perpX * (i - brushSize / 2);
+        const sampleY = start.y + perpY * (i - brushSize / 2);
+
+        const pixel = ctx.getImageData(
+          Math.round(sampleX),
+          Math.round(sampleY),
+          1,
+          1
+        );
+
+        tempCtx.fillStyle = `rgba(${pixel.data[0]}, ${pixel.data[1]}, ${
+          pixel.data[2]
+        }, ${pixel.data[3] / 255})`;
+        tempCtx.fillRect(0, i, tempCanvas.width, 1);
+      }
+    }
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.translate(start.x, start.y);
+    ctx.rotate(angle);
+    ctx.drawImage(tempCanvas, 0, -brushSize / 2);
+    ctx.restore();
+  };
+
+  const applyBlur = (ctx: CanvasRenderingContext2D, x: number, y: number) => {
+    const radius = brushSize / 2;
+    const blurRadius = Math.max(2, Math.floor(brushSize / 20)); // Even smaller kernel
+
+    // Create circular mask
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = brushSize;
+    tempCanvas.height = brushSize;
+    const tempCtx = tempCanvas.getContext("2d")!;
+
+    // Get source pixels
+    const imageData = ctx.getImageData(
+      Math.round(x - radius),
+      Math.round(y - radius),
+      brushSize,
+      brushSize
+    );
+    const pixels = imageData.data;
+    const original = new Uint8ClampedArray(pixels);
+
+    // Apply Gaussian blur with very subtle blend
+    for (let i = 0; i < pixels.length; i += 4) {
+      let r = 0,
+        g = 0,
+        b = 0,
+        a = 0;
+      let weightSum = 0;
+
+      const px = (i / 4) % brushSize;
+      const py = Math.floor(i / 4 / brushSize);
+
+      // Check if pixel is within circular brush area
+      const distanceFromCenter = Math.hypot(px - radius, py - radius);
+      if (distanceFromCenter <= radius) {
+        for (let dx = -blurRadius; dx <= blurRadius; dx++) {
+          for (let dy = -blurRadius; dy <= blurRadius; dy++) {
+            const x2 = px + dx;
+            const y2 = py + dy;
+
+            if (x2 >= 0 && x2 < brushSize && y2 >= 0 && y2 < brushSize) {
+              const j = (y2 * brushSize + x2) * 4;
+              const weight = Math.exp(
+                (-dx * dx - dy * dy) / (2 * blurRadius * blurRadius)
+              );
+
+              r += original[j] * weight;
+              g += original[j + 1] * weight;
+              b += original[j + 2] * weight;
+              a += original[j + 3] * weight;
+              weightSum += weight;
+            }
+          }
+        }
+
+        // Very subtle blend for single-pass effect
+        const blend = 0.3; // Reduced from 0.7 for subtler effect
+        const falloff = 1 - distanceFromCenter / radius;
+        const finalBlend = blend * falloff;
+
+        pixels[i] =
+          (r / weightSum) * finalBlend + original[i] * (1 - finalBlend);
+        pixels[i + 1] =
+          (g / weightSum) * finalBlend + original[i + 1] * (1 - finalBlend);
+        pixels[i + 2] =
+          (b / weightSum) * finalBlend + original[i + 2] * (1 - finalBlend);
+        pixels[i + 3] =
+          (a / weightSum) * finalBlend + original[i + 3] * (1 - finalBlend);
+      }
+    }
+
+    ctx.putImageData(imageData, Math.round(x - radius), Math.round(y - radius));
+  };
+
+  const applyPixelate = (
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number
+  ) => {
+    const radius = brushSize / 2;
+    const { x: clampedX, y: clampedY } = clampCoordinates(x, y, radius);
+
+    // Smaller pixelation size for more subtle effect
+    const pixelSize = Math.max(2, Math.floor(brushSize / 12));
+
+    for (let px = clampedX - radius; px < clampedX + radius; px += pixelSize) {
+      for (
+        let py = clampedY - radius;
+        py < clampedY + radius;
+        py += pixelSize
+      ) {
+        if (Math.hypot(px - clampedX, py - clampedY) > radius) continue;
+
+        const imageData = ctx.getImageData(px, py, pixelSize, pixelSize);
+        const pixels = imageData.data;
+        let r = 0,
+          g = 0,
+          b = 0,
+          a = 0;
+        let count = 0;
+
+        for (let i = 0; i < pixels.length; i += 4) {
+          r += pixels[i];
+          g += pixels[i + 1];
+          b += pixels[i + 2];
+          a += pixels[i + 3];
+          count++;
+        }
+
+        ctx.fillStyle = `rgba(${r / count}, ${g / count}, ${b / count}, ${
+          a / count / 255
+        })`;
+        ctx.fillRect(px, py, pixelSize, pixelSize);
+      }
+    }
+  };
+
+  // Update brush cursor position and size
+  const updateBrush = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const brush = brushRef.current;
+    if (!brush || !canvasRef.current) return;
+
+    const metrics = getCanvasMetrics(e);
+    if (!metrics) return;
+
+    const { screenX, screenY, scaleX } = metrics;
+
+    // Update brush size and position
+    const visualBrushSize = brushSize * scaleX;
+    brush.style.width = `${visualBrushSize}px`;
+    brush.style.height = `${visualBrushSize}px`;
+    brush.style.left = `${screenX}px`;
+    brush.style.top = `${screenY}px`;
+
+    // Add red line for stretch effect while keeping circle white
+    if (effectType === 0) {
+      brush.innerHTML = `
+        <div 
+          class="absolute top-0 left-1/2 -translate-x-1/2 bg-red-500" 
+          style="
+            width: 1px; 
+            height: 100%;
+            opacity: 0.8;
+          "
+        ></div>
+      `;
+    } else {
+      brush.innerHTML = "";
+    }
+  };
+
+  // Handle mouse entering/leaving canvas
+  const handleMouseEnter = () => setIsOverCanvas(true);
+  const handleMouseLeave = () => {
+    setIsOverCanvas(false);
+    stopDrawing();
+  };
+
+  // Modified draw function to use new coordinate system
+  const draw = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || !canvasRef.current) return;
+
+    const metrics = getCanvasMetrics(e);
+    if (!metrics) return;
+
+    const { canvasX, canvasY } = metrics;
+
+    if (effectType === 0 && stretchStart) {
+      setStretchPreview({ x: canvasX, y: canvasY });
+    } else {
+      const ctx = canvasRef.current.getContext("2d");
+      if (ctx) {
+        ctx.save();
+        switch (effectType) {
+          case 1:
+            applyBlur(ctx, canvasX, canvasY);
+            break;
+          case 2:
+            applyPixelate(ctx, canvasX, canvasY);
+            break;
+        }
+        ctx.restore();
+      }
+    }
+
+    setLastX(canvasX);
+    setLastY(canvasY);
+  };
+
+  // Modified start drawing to use new coordinate system
+  const startDrawing = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const metrics = getCanvasMetrics(e);
+    if (!metrics) return;
+
+    const { canvasX, canvasY } = metrics;
+
+    if (effectType === 0) {
+      // Stretch effect
+      setStretchStart({ x: canvasX, y: canvasY });
+      setStretchPreview({ x: canvasX, y: canvasY });
+    }
+    setIsDrawing(true);
+    setLastX(canvasX);
+    setLastY(canvasY);
+  };
+
+  const stopDrawing = (e?: React.MouseEvent<HTMLCanvasElement>) => {
+    if (
+      effectType === 0 &&
+      stretchStart &&
+      stretchPreview &&
+      canvasRef.current
+    ) {
+      const ctx = canvasRef.current.getContext("2d");
+      if (ctx) {
+        applyStretch(ctx, stretchStart, stretchPreview);
+        saveState(); // Save state after stretch
+      }
+    }
+
+    setIsDrawing(false);
+    setStretchStart(null);
+    setStretchPreview(null);
   };
 
   const handleWheel = (event: React.WheelEvent<HTMLCanvasElement>) => {
     if (event.shiftKey) {
       event.preventDefault();
       const delta = event.deltaY > 0 ? -1 : 1;
-      const newBrushSize = Math.max(1, Math.min(250, brushSize + delta));
+      const newBrushSize = Math.max(1, Math.min(200, brushSize + delta));
       onBrushSizeChange(newBrushSize);
+
+      // Immediately update brush size visually
+      const brush = brushRef.current;
+      if (brush && canvasRef.current) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const scaleX = rect.width / canvasRef.current.width;
+        const visualBrushSize = newBrushSize * scaleX;
+        brush.style.width = `${visualBrushSize}px`;
+        brush.style.height = `${visualBrushSize}px`;
+      }
     }
   };
 
-  const startStretching = (event: React.MouseEvent<HTMLCanvasElement>) => {
+  const clampCoordinates = (x: number, y: number, radius: number) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) return { x, y };
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const { offsetX, offsetY } = event.nativeEvent;
-    setIsStretching(true);
-    setStartPosition({ x: offsetX, y: offsetY });
-
-    const halfBrush = Math.floor(brushSize / 2);
-    const left = Math.max(0, offsetX - halfBrush);
-    const top = Math.max(0, offsetY - halfBrush);
-    const width = Math.min(brushSize, canvas.width - left);
-    const height = Math.min(brushSize, canvas.height - top);
-
-    const buffer = ctx.getImageData(left, top, width, height);
-    setStretchBuffer(buffer);
+    return {
+      x: Math.min(Math.max(x, radius), canvas.width - radius),
+      y: Math.min(Math.max(y, radius), canvas.height - radius),
+    };
   };
 
-  const stopStretching = () => {
-    setIsStretching(false);
-    setStartPosition(null);
-    setStretchBuffer(null);
-  };
-
-  const stretchPixels = (
-    ctx: CanvasRenderingContext2D,
-    startX: number,
-    startY: number,
-    dx: number,
-    dy: number,
-    brushSize: number,
-    buffer: ImageData,
-    originalCanvas: HTMLCanvasElement
-  ) => {
-    const halfBrush = Math.floor(brushSize / 2);
-    const sourceLeft = Math.max(0, startX - halfBrush);
-    const sourceTop = Math.max(0, startY - halfBrush);
-    const sourceWidth = Math.min(brushSize, ctx.canvas.width - sourceLeft);
-    const sourceHeight = Math.min(brushSize, ctx.canvas.height - sourceTop);
-
-    const targetLeft = sourceLeft + dx;
-    const targetTop = sourceTop + dy;
-
-    // Get the current state of the target area
-    const imageData = ctx.getImageData(
-      targetLeft,
-      targetTop,
-      sourceWidth,
-      sourceHeight
-    );
-    const { data } = imageData;
-    const { data: bufferData } = buffer;
-
-    switch (stretchLevel) {
-      case 1: // Regular pixel stretch
-        for (let y = 0; y < sourceHeight; y++) {
-          for (let x = 0; x < sourceWidth; x++) {
-            const i = (y * sourceWidth + x) * 4;
-            const sourceX = Math.max(0, Math.min(sourceWidth - 1, x));
-            const sourceY = Math.max(0, Math.min(sourceHeight - 1, y));
-            const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
-
-            data[i] = bufferData[sourceIndex];
-            data[i + 1] = bufferData[sourceIndex + 1];
-            data[i + 2] = bufferData[sourceIndex + 2];
-            data[i + 3] = bufferData[sourceIndex + 3];
-          }
-        }
-        break;
-
-      case 2: // Pixelate effect (more blocky - 8x8)
-        const pixelSize = 8; // Increased from 4 to 8 for blockier effect
-        for (let y = 0; y < sourceHeight; y += pixelSize) {
-          for (let x = 0; x < sourceWidth; x += pixelSize) {
-            // Calculate average color for this block
-            let r = 0,
-              g = 0,
-              b = 0,
-              a = 0,
-              count = 0;
-
-            for (let py = 0; py < pixelSize && y + py < sourceHeight; py++) {
-              for (let px = 0; px < pixelSize && x + px < sourceWidth; px++) {
-                const idx = ((y + py) * sourceWidth + (x + px)) * 4;
-                r += bufferData[idx];
-                g += bufferData[idx + 1];
-                b += bufferData[idx + 2];
-                a += bufferData[idx + 3];
-                count++;
-              }
-            }
-
-            // Apply averaged color to all pixels in this block
-            const avgR = Math.round(r / count);
-            const avgG = Math.round(g / count);
-            const avgB = Math.round(b / count);
-            const avgA = Math.round(a / count);
-
-            for (let py = 0; py < pixelSize && y + py < sourceHeight; py++) {
-              for (let px = 0; px < pixelSize && x + px < sourceWidth; px++) {
-                const idx = ((y + py) * sourceWidth + (x + px)) * 4;
-                data[idx] = avgR;
-                data[idx + 1] = avgG;
-                data[idx + 2] = avgB;
-                data[idx + 3] = avgA;
-              }
-            }
-          }
-        }
-        break;
-
-      case 3: // Gaussian blur
-        const radius = 2;
-        const sigma = 1.5;
-
-        // Create Gaussian kernel
-        const kernel: number[] = [];
-        let kernelSum = 0;
-        for (let y = -radius; y <= radius; y++) {
-          for (let x = -radius; x <= radius; x++) {
-            const exp = -(x * x + y * y) / (2 * sigma * sigma);
-            const value = Math.exp(exp) / (2 * Math.PI * sigma * sigma);
-            kernel.push(value);
-            kernelSum += value;
-          }
-        }
-        // Normalize kernel
-        kernel.forEach((value, i) => (kernel[i] = value / kernelSum));
-
-        // Apply Gaussian blur
-        const tempData = new Uint8ClampedArray(data);
-        for (let y = 0; y < sourceHeight; y++) {
-          for (let x = 0; x < sourceWidth; x++) {
-            let r = 0,
-              g = 0,
-              b = 0,
-              a = 0;
-            let kernelIndex = 0;
-
-            for (let ky = -radius; ky <= radius; ky++) {
-              for (let kx = -radius; kx <= radius; kx++) {
-                const px = Math.min(Math.max(x + kx, 0), sourceWidth - 1);
-                const py = Math.min(Math.max(y + ky, 0), sourceHeight - 1);
-                const i = (py * sourceWidth + px) * 4;
-
-                r += bufferData[i] * kernel[kernelIndex];
-                g += bufferData[i + 1] * kernel[kernelIndex];
-                b += bufferData[i + 2] * kernel[kernelIndex];
-                a += bufferData[i + 3] * kernel[kernelIndex];
-                kernelIndex++;
-              }
-            }
-
-            const i = (y * sourceWidth + x) * 4;
-            data[i] = Math.round(r);
-            data[i + 1] = Math.round(g);
-            data[i + 2] = Math.round(b);
-            data[i + 3] = Math.round(a);
-          }
-        }
-        break;
+  // When finishing a continuous effect (blur/pixelate), save state
+  const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (effectType !== 0) {
+      saveState();
     }
-
-    // Apply the effect to the target area
-    ctx.putImageData(imageData, targetLeft, targetTop);
+    stopDrawing(e);
   };
 
   return (
-    <div className="relative">
+    <div
+      ref={canvasContainerRef}
+      className="relative"
+      style={{ cursor: "none" }}
+    >
       <canvas
         ref={canvasRef}
-        onMouseDown={startStretching}
-        onMouseUp={stopStretching}
-        onMouseOut={stopStretching}
-        onMouseMove={handleMouseMove}
+        onMouseDown={startDrawing}
+        onMouseMove={(e) => {
+          updateBrush(e);
+          draw(e);
+        }}
+        onMouseUp={handleMouseUp}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
         onWheel={handleWheel}
-        className="border border-gray-300"
-        aria-label="Image canvas for pixel stretching"
+        className="block" // Ensure canvas is block-level
       />
-      <canvas
-        ref={cursorCanvasRef}
-        className="absolute top-0 left-0 pointer-events-none"
-        aria-hidden="true"
-      />
+      {isOverCanvas && (
+        <div
+          ref={brushRef}
+          className="fixed pointer-events-none border-2 border-white shadow-sm"
+          style={{
+            borderRadius: effectType === 2 ? "0" : "50%",
+            transform: "translate(-50%, -50%)",
+            zIndex: 1000,
+          }}
+        />
+      )}
     </div>
   );
 };
